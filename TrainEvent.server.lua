@@ -1,523 +1,880 @@
 --[[
-    TrainEvent.server.lua — Map3 (Subway) train hazard
-    Once per round, a train rushes through at a random time. Players on the
-    tracks get bubbled and arc-flung to the nearest platform.
+	TrainEvent.server.lua
 
-    Expected hierarchy:
-      SUBWAY > TRAIN (Model)
-      SUBWAY > ForScript > Main / Left / Right (BaseParts)
-      SUBWAY > JumpPads > JUMP (x6) > Light (BasePart)
-      SUBWAY > Lights > Ceiling_Light > BeamBase
+	Server-side hazard controller for the Subway map on Map3.
+
+	Round flow:
+	1. Bind to the live Subway model when it appears in Workspace.
+	2. During a Map3 round, schedule one train pass at a random time.
+	3. Trigger horn + warning-light flicker before the train arrives.
+	4. Move the train across the track zone.
+	5. Bubble and arc-fling any player standing on the tracks.
+	6. Restore player state and reset the train when the event ends.
+
+	Expected map hierarchy:
+	  Subway
+	    SUBWAY
+	      TRAIN
+	      ForScript
+	        Main
+	        Left
+	        Right
+	      JumpPads
+	        JUMP
+	          Light
+	      Lights
+	        Ceiling_Light
+	          BeamBase
 ]]
 
-local Players     = game:GetService("Players")
-local Workspace   = game:GetService("Workspace")
-local RunService  = game:GetService("RunService")
-local RS          = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
--- Round state
-local RoundActive      = RS:WaitForChild("RoundActive")
-local CurrentMapName   = RS:WaitForChild("CurrentMapName")
-local RoundSecondsLeft = RS:WaitForChild("RoundSecondsLeft")
+-- These values are assumed to be created by the wider round-management system.
+-- This script only consumes them; it does not own their lifecycle.
+local RoundActive = ReplicatedStorage:WaitForChild("RoundActive")
+local CurrentMapName = ReplicatedStorage:WaitForChild("CurrentMapName")
+local RoundSecondsLeft = ReplicatedStorage:WaitForChild("RoundSecondsLeft")
 
--- Remotes
-local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
-Remotes.Name = "Remotes"; Remotes.Parent = RS
+-- Tunable behavior values are grouped together so the hazard can be adjusted
+-- without digging through logic-heavy functions.
+local CONFIG = {
+	-- Earliest second in the round when the train is allowed to spawn.
+	TrainEarliest = 15,
+	-- How much time should remain in the round after the train event finishes.
+	TrainBufferEnd = 20,
+	-- How long the train physically travels through the station.
+	TrainDuration = 2.5,
+	-- How long a hit player spends in the scripted fling motion.
+	FlingTime = 1.0,
+	-- Height of the arc used when throwing players to safety.
+	FlingArcHeight = 5,
+	-- Extra time the player stays bubbled after landing.
+	BubbleAfter = 5.0,
+	-- Warning lead time between horn/lights and actual train movement.
+	WarningTime = 3.0,
+	-- How quickly the warning lights alternate between normal and red.
+	FlickerRate = 0.15,
+}
 
-local TrainRemote = Remotes:FindFirstChild("TrainEvent") or Instance.new("RemoteEvent")
-TrainRemote.Name = "TrainEvent"; TrainRemote.Parent = Remotes
+-- Visual palette used by the warning system.
+-- Keeping these in one table makes the presentation intentionally consistent.
+local COLORS = {
+	Normal = Color3.fromRGB(152, 194, 219),
+	Warning = Color3.fromRGB(255, 0, 0),
+	BeamNormal = Color3.fromRGB(255, 255, 255),
+	SpotNormal = Color3.fromRGB(255, 229, 1),
+	LightBaseNormal = Color3.fromRGB(241, 231, 199),
+}
 
--- SFX
-local SFXFolder     = RS:FindFirstChild("SFX")
-local POP_SFX       = SFXFolder and SFXFolder:FindFirstChild("Pop") or nil
-local HORN_SFX      = SFXFolder and SFXFolder:FindFirstChild("TrainHorn") or nil
-local TRAIN_SND_SFX = SFXFolder and SFXFolder:FindFirstChild("TrainSound") or nil
-
-if not POP_SFX then
-	for _, v in ipairs(RS:GetDescendants()) do
-		if v:IsA("Sound") and v.Name == "Pop" then POP_SFX = v; break end
+-- Utility: create a folder if it does not already exist.
+-- This lets the script safely self-bootstrap its remote container.
+local function getOrCreateFolder(parent, name)
+	local folder = parent:FindFirstChild(name)
+	if folder then
+		return folder
 	end
+
+	folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
 end
 
-local function playPopAt(pos)
-	if not POP_SFX then return end
-	local a = Instance.new("Attachment")
-	a.WorldPosition = pos
-	a.Parent = Workspace.Terrain
-	local s = POP_SFX:Clone()
-	s.Parent = a
-	s:Play()
-	s.Ended:Connect(function() if a then a:Destroy() end end)
-	task.delay(4, function() if a and a.Parent then a:Destroy() end end)
-end
-
--- Config
-local TRAIN_EARLIEST   = 15
-local TRAIN_BUFFER_END = 20
-local TRAIN_DURATION   = 2.5
-local FLING_TIME       = 1.0
-local FLING_ARC_HEIGHT = 5
-local BUBBLE_AFTER     = 5.0
-local WARNING_TIME     = 3.0
-local FLICKER_RATE     = 0.15
-
--- Light colors
-local NORMAL_COLOR  = Color3.fromRGB(152, 194, 219)
-local WARNING_COLOR = Color3.fromRGB(255, 0, 0)
-
-local BEAM_NORMAL      = Color3.fromRGB(255, 255, 255)
-local SPOT_NORMAL      = Color3.fromRGB(255, 229, 1)
-local LIGHTBASE_NORMAL = Color3.fromRGB(241, 231, 199)
-
--- References (populated by setupFromModel)
-local trainModel    = nil
-local mainZone      = nil
-local leftPart      = nil
-local rightPart     = nil
-local startPivot    = nil
-local endPivot      = nil
-local jumpLights    = {}
-local ceilingLights = {}
-local flickerSet    = {}
-
--- State
-local trainAffected  = {}
-local roundToken     = 0
-local moving         = false
-local flickerConn    = nil
-local trainSoundInst = nil
-
--- Helpers
-
-local function hrpOf(plr)
-	local c = plr and plr.Character
-	return c and c:FindFirstChild("HumanoidRootPart") or nil
-end
-
-local function isInsidePart(part, pos)
-	local localPos = part.CFrame:PointToObjectSpace(pos)
-	local half = part.Size / 2
-	return math.abs(localPos.X) <= half.X
-		and math.abs(localPos.Y) <= half.Y + 3
-		and math.abs(localPos.Z) <= half.Z
-end
-
-local function getTargetPart(playerPos)
-	if not leftPart or not rightPart then return leftPart or rightPart end
-	local dLeft  = (leftPart.Position  - playerPos).Magnitude
-	local dRight = (rightPart.Position - playerPos).Magnitude
-	return (dLeft <= dRight) and leftPart or rightPart
-end
-
--- Light flicker
-
-local function restoreCeilingLights()
-	for _, cl in ipairs(ceilingLights) do
-		if cl.beam then cl.beam.Color = ColorSequence.new(BEAM_NORMAL) end
-		if cl.spot then cl.spot.Color = SPOT_NORMAL end
-		if cl.lightbase then cl.lightbase.Color = LIGHTBASE_NORMAL end
+-- Utility: create or reuse the RemoteEvent that the clients listen to for
+-- train-related effects such as camera shake or impact feedback.
+local function getOrCreateRemoteEvent(parent, name)
+	local remote = parent:FindFirstChild(name)
+	if remote and remote:IsA("RemoteEvent") then
+		return remote
 	end
+
+	remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	remote.Parent = parent
+	return remote
 end
 
-local function startFlicker(myToken)
-	if flickerConn then flickerConn:Disconnect() end
-	flickerConn = RunService.Heartbeat:Connect(function()
-		if roundToken ~= myToken then
-			flickerConn:Disconnect()
-			flickerConn = nil
-			for _, light in ipairs(jumpLights) do light.Color = NORMAL_COLOR end
-			restoreCeilingLights()
-			return
+local Remotes = getOrCreateFolder(ReplicatedStorage, "Remotes")
+local TrainRemote = getOrCreateRemoteEvent(Remotes, "TrainEvent")
+
+-- Sound lookup is deliberately tolerant: it prefers an SFX folder but will
+-- fall back to a full ReplicatedStorage search so the showcase script is less
+-- fragile to asset organization differences.
+local function findSound(name)
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX")
+	if sfxFolder then
+		local sound = sfxFolder:FindFirstChild(name)
+		if sound and sound:IsA("Sound") then
+			return sound
 		end
-		local on = math.floor(os.clock() / FLICKER_RATE) % 2 == 0
+	end
 
-		local color = on and WARNING_COLOR or NORMAL_COLOR
-		for _, light in ipairs(jumpLights) do light.Color = color end
+	for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
+		if descendant:IsA("Sound") and descendant.Name == name then
+			return descendant
+		end
+	end
 
-		for i, cl in ipairs(ceilingLights) do
-			if flickerSet[i] then
-				if cl.beam then cl.beam.Color = on and ColorSequence.new(WARNING_COLOR) or ColorSequence.new(BEAM_NORMAL) end
-				if cl.spot then cl.spot.Color = on and WARNING_COLOR or SPOT_NORMAL end
-				if cl.lightbase then cl.lightbase.Color = on and WARNING_COLOR or LIGHTBASE_NORMAL end
-			end
+	return nil
+end
+
+local POP_SOUND = findSound("Pop")
+local HORN_SOUND = findSound("TrainHorn")
+local TRAIN_SOUND = findSound("TrainSound")
+
+-- mapState stores references tied to the currently loaded Subway model.
+-- This data becomes invalid when the map is removed and gets rebuilt on load.
+local mapState = {
+	-- Model that is physically moved during the hazard.
+	trainModel = nil,
+	-- Main trigger volume representing the dangerous track area.
+	mainZone = nil,
+	-- Safe landing areas on each side of the tracks.
+	leftPlatform = nil,
+	rightPlatform = nil,
+	-- Precomputed start/end transforms for the train animation path.
+	startPivot = nil,
+	endPivot = nil,
+	-- Collections of lights affected by the warning pass.
+	jumpLights = {},
+	ceilingLights = {},
+	-- Set of ceiling-light indices chosen to flicker this round/map bind.
+	flickerSet = {},
+}
+
+-- runtime stores transient execution state for the currently active hazard.
+local runtime = {
+	-- Invalidation token used to cancel delayed work from prior rounds.
+	roundToken = 0,
+	-- Heartbeat connection for warning-light flicker.
+	flickerConnection = nil,
+	-- Live looping sound attached to the moving train.
+	trainSoundInstance = nil,
+	-- Tracks which players were put into train-controlled state.
+	affectedPlayers = {},
+}
+
+-- Each new round or cleanup increments the token so any previously scheduled
+-- callbacks become no-ops when they wake up.
+local function nextRoundToken()
+	runtime.roundToken += 1
+	return runtime.roundToken
+end
+
+-- Convenience accessor used throughout the script because nearly every action
+-- ultimately drives the character through the HumanoidRootPart.
+local function getCharacterRoot(player)
+	local character = player and player.Character
+	return character and character:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- Separate helper for Humanoid access keeps the higher-level code readable.
+local function getHumanoid(player)
+	local character = player and player.Character
+	return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+-- Reset physics state after the scripted sequence so the player returns to
+-- normal Roblox character simulation.
+local function resetRootMotion(root)
+	if not root then
+		return
+	end
+
+	root.Anchored = false
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Explicitly re-enable the locomotion states this script expects the player to
+-- have once the train interaction is over.
+local function restoreHumanoidControl(humanoid)
+	if not humanoid then
+		return
+	end
+
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, true)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+	humanoid.AutoRotate = true
+
+	if humanoid.JumpPower < 1 then
+		humanoid.JumpPower = 50
+	end
+end
+
+-- Generic helper for spatial one-shot audio. The sound is cloned onto a
+-- temporary Attachment because Roblox sounds need a 3D parent to play in-world.
+local function playOneShotAt(soundTemplate, worldPosition, lifetime)
+	if not soundTemplate then
+		return
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.WorldPosition = worldPosition
+	attachment.Parent = Workspace.Terrain
+
+	local sound = soundTemplate:Clone()
+	sound.Parent = attachment
+	sound:Play()
+
+	-- Destroy on Ended for normal cleanup, plus a fallback timed destroy in case
+	-- the sound asset never fires Ended for any reason.
+	sound.Ended:Connect(function()
+		if attachment then
+			attachment:Destroy()
+		end
+	end)
+
+	task.delay(lifetime, function()
+		if attachment and attachment.Parent then
+			attachment:Destroy()
 		end
 	end)
 end
 
-local function stopFlicker()
-	if flickerConn then flickerConn:Disconnect(); flickerConn = nil end
-	for _, light in ipairs(jumpLights) do light.Color = NORMAL_COLOR end
+-- Return all ceiling fixtures to their baseline art state.
+-- This is called both on normal completion and on early cancellation.
+local function restoreCeilingLights()
+	for _, lightInfo in ipairs(mapState.ceilingLights) do
+		if lightInfo.beam then
+			lightInfo.beam.Color = ColorSequence.new(COLORS.BeamNormal)
+		end
+		if lightInfo.spot then
+			lightInfo.spot.Color = COLORS.SpotNormal
+		end
+		if lightInfo.lightBase then
+			lightInfo.lightBase.Color = COLORS.LightBaseNormal
+		end
+	end
+end
+
+-- Stop warning visuals and force all affected lights back to their non-alert
+-- presentation.
+local function stopWarningFlicker()
+	if runtime.flickerConnection then
+		runtime.flickerConnection:Disconnect()
+		runtime.flickerConnection = nil
+	end
+
+	for _, light in ipairs(mapState.jumpLights) do
+		light.Color = COLORS.Normal
+	end
+
 	restoreCeilingLights()
 end
 
-local function playHorn()
-	if not HORN_SFX or not mainZone then return end
-	local a = Instance.new("Attachment")
-	a.WorldPosition = mainZone.Position
-	a.Parent = Workspace.Terrain
-	local s = HORN_SFX:Clone()
-	s.Parent = a
-	s:Play()
-	s.Ended:Connect(function() if a then a:Destroy() end end)
-	task.delay(10, function() if a and a.Parent then a:Destroy() end end)
+-- Flicker is driven from Heartbeat so the pattern stays in sync with real time
+-- and instantly stops when the round token changes.
+local function startWarningFlicker(roundToken)
+	stopWarningFlicker()
+
+	runtime.flickerConnection = RunService.Heartbeat:Connect(function()
+		-- If another round started or cleanup ran, this effect belongs to stale work.
+		if runtime.roundToken ~= roundToken then
+			stopWarningFlicker()
+			return
+		end
+
+		-- os.clock-based toggling avoids storing extra state and gives a steady blink.
+		local isWarningFrame = math.floor(os.clock() / CONFIG.FlickerRate) % 2 == 0
+		local jumpColor = isWarningFrame and COLORS.Warning or COLORS.Normal
+
+		-- All jump pad lights flicker together so the track warning reads clearly.
+		for _, light in ipairs(mapState.jumpLights) do
+			light.Color = jumpColor
+		end
+
+		-- Ceiling lights only flicker for a chosen subset, which makes the station
+		-- feel less uniform and visually more alarming.
+		for index, lightInfo in ipairs(mapState.ceilingLights) do
+			if mapState.flickerSet[index] then
+				if lightInfo.beam then
+					lightInfo.beam.Color = isWarningFrame
+						and ColorSequence.new(COLORS.Warning)
+						or ColorSequence.new(COLORS.BeamNormal)
+				end
+				if lightInfo.spot then
+					lightInfo.spot.Color = isWarningFrame and COLORS.Warning or COLORS.SpotNormal
+				end
+				if lightInfo.lightBase then
+					lightInfo.lightBase.Color = isWarningFrame and COLORS.Warning or COLORS.LightBaseNormal
+				end
+			end
+		end
+	end)
 end
 
--- Train sound
-
-local function startTrainSound()
-	if not TRAIN_SND_SFX or not trainModel then return end
-	local part = trainModel.PrimaryPart or trainModel:FindFirstChildWhichIsA("BasePart")
-	if not part then return end
-	trainSoundInst = TRAIN_SND_SFX:Clone()
-	trainSoundInst.Looped = true
-	trainSoundInst.Parent = part
-	trainSoundInst:Play()
-end
-
-local function stopTrainSound()
-	if trainSoundInst then
-		trainSoundInst:Stop()
-		trainSoundInst:Destroy()
-		trainSoundInst = nil
+-- Start the looping train movement sound. A clone is used so the original
+-- sound asset in storage remains untouched.
+local function startTrainLoopSound()
+	if not TRAIN_SOUND or not mapState.trainModel then
+		return
 	end
+
+	local soundParent = mapState.trainModel.PrimaryPart or mapState.trainModel:FindFirstChildWhichIsA("BasePart")
+	if not soundParent then
+		return
+	end
+
+	runtime.trainSoundInstance = TRAIN_SOUND:Clone()
+	runtime.trainSoundInstance.Looped = true
+	runtime.trainSoundInstance.Parent = soundParent
+	runtime.trainSoundInstance:Play()
 end
 
--- Fling
+-- Tear down the temporary loop sound once the train stops or the event aborts.
+local function stopTrainLoopSound()
+	if not runtime.trainSoundInstance then
+		return
+	end
 
-local function flingPlayer(plr, myToken)
-	local hrp = hrpOf(plr)
-	if not hrp then return end
+	runtime.trainSoundInstance:Stop()
+	runtime.trainSoundInstance:Destroy()
+	runtime.trainSoundInstance = nil
+end
 
-	local wasBubbled = plr:GetAttribute("Bubbled") == true
-	local target = getTargetPart(hrp.Position)
-	if not target then return end
+-- Cheap inside-volume test against the main hazard part.
+-- The Y check gets a small grace margin so players near the top face still count.
+local function isInsidePart(part, worldPosition)
+	local localPosition = part.CFrame:PointToObjectSpace(worldPosition)
+	local halfSize = part.Size / 2
 
-	local startPos = hrp.Position
-	local endPos   = target.Position
+	return math.abs(localPosition.X) <= halfSize.X
+		and math.abs(localPosition.Y) <= halfSize.Y + 3
+		and math.abs(localPosition.Z) <= halfSize.Z
+end
 
-	trainAffected[plr] = true
+-- Pick the closer safe platform so the recovery feels spatially consistent.
+local function getNearestPlatform(worldPosition)
+	if not mapState.leftPlatform or not mapState.rightPlatform then
+		return mapState.leftPlatform or mapState.rightPlatform
+	end
 
-	-- TrainFlung must be set before Bubbled to prevent BubbleFreeze anchoring early
-	plr:SetAttribute("TrainFlung", true)
-	plr:SetAttribute("TrainBubbled", true)
+	local leftDistance = (mapState.leftPlatform.Position - worldPosition).Magnitude
+	local rightDistance = (mapState.rightPlatform.Position - worldPosition).Magnitude
 
-	local bToken = (plr:GetAttribute("BubbleToken") or 0) + 1
-	plr:SetAttribute("BubbleToken", bToken)
-	if not wasBubbled then plr:SetAttribute("Bubbled", true) end
+	if leftDistance <= rightDistance then
+		return mapState.leftPlatform
+	end
 
-	hrp.Anchored = true
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
+	return mapState.rightPlatform
+end
 
-	plr:SetAttribute("ServerTeleportAt", os.clock())
-	TrainRemote:FireClient(plr, "crash")
+-- Centralized cleanup for any player currently controlled by this script.
+-- Keeping this in one place reduces the risk of forgetting one piece of state.
+local function releasePlayerFromTrain(player)
+	runtime.affectedPlayers[player] = nil
+	player:SetAttribute("TrainFlung", nil)
+	player:SetAttribute("TrainBubbled", nil)
 
-	local _, startYaw, _ = hrp.CFrame:ToEulerAnglesYXZ()
-	local flingStart = os.clock()
-	local flingConn
-	flingConn = RunService.Heartbeat:Connect(function()
-		local h = hrpOf(plr)
+	if player:GetAttribute("Bubbled") == true then
+		player:SetAttribute("Bubbled", false)
+	end
 
-		if roundToken ~= myToken or not plr.Parent or not h
-			or plr:GetAttribute("TrainFlung") ~= true then
-			flingConn:Disconnect()
-			if plr.Parent and plr:GetAttribute("TrainFlung") == true then
-				plr:SetAttribute("TrainFlung", nil)
+	local root = getCharacterRoot(player)
+	local humanoid = getHumanoid(player)
+
+	resetRootMotion(root)
+
+	-- Network ownership is handed back to the owning client once the server-side
+	-- forced movement is complete.
+	if root then
+		pcall(function()
+			root:SetNetworkOwner(player)
+		end)
+	end
+
+	restoreHumanoidControl(humanoid)
+end
+
+-- Main hit response for a player touched by the train.
+-- The sequence is: mark state, anchor root, animate along an arc, wait, pop,
+-- then restore movement control.
+local function flingPlayerToSafety(player, roundToken)
+	local root = getCharacterRoot(player)
+	if not root then
+		return
+	end
+
+	local destination = getNearestPlatform(root.Position)
+	if not destination then
+		return
+	end
+
+	-- Preserve whether the player was already bubbled by another system so this
+	-- script can avoid trampling unrelated game state.
+	local wasAlreadyBubbled = player:GetAttribute("Bubbled") == true
+	local startPosition = root.Position
+	local endPosition = destination.Position
+	local _, startYaw, _ = root.CFrame:ToEulerAnglesYXZ()
+
+	-- These attributes act as both state markers for other scripts and guards for
+	-- this script's delayed cleanup work.
+	runtime.affectedPlayers[player] = true
+	player:SetAttribute("TrainFlung", true)
+	player:SetAttribute("TrainBubbled", true)
+
+	-- BubbleToken acts as a generation counter. If some other script updates the
+	-- bubble state later, the delayed unbubble in this function will not clobber it.
+	local bubbleToken = (player:GetAttribute("BubbleToken") or 0) + 1
+	player:SetAttribute("BubbleToken", bubbleToken)
+
+	if not wasAlreadyBubbled then
+		player:SetAttribute("Bubbled", true)
+	end
+
+	-- The player is anchored so the server has full control over the arc motion.
+	root.Anchored = true
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	-- The remote gives the client a hook for local camera or UI feedback.
+	player:SetAttribute("ServerTeleportAt", os.clock())
+	TrainRemote:FireClient(player, "crash")
+
+	local startTime = os.clock()
+	local connection
+	connection = RunService.Heartbeat:Connect(function()
+		local currentRoot = getCharacterRoot(player)
+		-- Abort if the round changed, the player left, or the character changed.
+		if runtime.roundToken ~= roundToken or not player.Parent or not currentRoot then
+			connection:Disconnect()
+			if player.Parent and player:GetAttribute("TrainFlung") == true then
+				player:SetAttribute("TrainFlung", nil)
 			end
 			return
 		end
 
-		local elapsed = os.clock() - flingStart
-		local alpha   = math.clamp(elapsed / FLING_TIME, 0, 1)
-		local smooth  = alpha * alpha * (3 - 2 * alpha)
+		-- Another system may clear TrainFlung early, so respect that and stop.
+		if player:GetAttribute("TrainFlung") ~= true then
+			connection:Disconnect()
+			return
+		end
 
-		local pos = startPos:Lerp(endPos, smooth)
-		local arc = 4 * FLING_ARC_HEIGHT * alpha * (1 - alpha)
-		pos = pos + Vector3.new(0, arc, 0)
+		-- Smoothstep gives a cleaner start/end than linear interpolation.
+		local elapsed = os.clock() - startTime
+		local alpha = math.clamp(elapsed / CONFIG.FlingTime, 0, 1)
+		local smoothAlpha = alpha * alpha * (3 - 2 * alpha)
 
-		h.CFrame = CFrame.new(pos) * CFrame.Angles(0, startYaw, 0)
+		-- Horizontal interpolation plus a simple parabola produces a readable arc.
+		local travelPosition = startPosition:Lerp(endPosition, smoothAlpha)
+		local arcOffset = 4 * CONFIG.FlingArcHeight * alpha * (1 - alpha)
+		travelPosition += Vector3.new(0, arcOffset, 0)
 
-		if alpha >= 1 then
-			flingConn:Disconnect()
-			plr:SetAttribute("TrainFlung", nil)
+		-- Preserve original yaw so the player does not spin while being moved.
+		currentRoot.CFrame = CFrame.new(travelPosition) * CFrame.Angles(0, startYaw, 0)
 
-			task.delay(BUBBLE_AFTER, function()
-				if not plr.Parent then return end
-				if plr:GetAttribute("Bubbled") == true
-					and plr:GetAttribute("BubbleToken") == bToken then
-					plr:SetAttribute("Bubbled", false)
-					plr:SetAttribute("TrainBubbled", nil)
-					trainAffected[plr] = nil
+		if alpha < 1 then
+			return
+		end
 
-					local popH = hrpOf(plr)
-					if popH then playPopAt(popH.Position) end
+		connection:Disconnect()
+		player:SetAttribute("TrainFlung", nil)
 
-					task.defer(function()
-						if not plr.Parent then return end
-						local rh  = hrpOf(plr)
-						local rc  = plr.Character
-						local rhum = rc and rc:FindFirstChildOfClass("Humanoid")
-						if rh then
-							rh.Anchored = false
-							rh.AssemblyLinearVelocity = Vector3.zero
-							rh.AssemblyAngularVelocity = Vector3.zero
-							pcall(function() rh:SetNetworkOwner(plr) end)
-						end
-						if rhum then
-							rhum:SetStateEnabled(Enum.HumanoidStateType.Running, true)
-							rhum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-							rhum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-							rhum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
-							rhum.AutoRotate = true
-							if rhum.JumpPower < 1 then rhum.JumpPower = 50 end
-						end
-					end)
+		-- Once the motion finishes, keep the player bubbled for a short recovery
+		-- window before fully restoring normal play.
+		task.delay(CONFIG.BubbleAfter, function()
+			if not player.Parent then
+				return
+			end
+
+			if player:GetAttribute("Bubbled") ~= true then
+				return
+			end
+
+			-- Only unbubble if the same train-owned bubble instance is still active.
+			if player:GetAttribute("BubbleToken") ~= bubbleToken then
+				return
+			end
+
+			player:SetAttribute("Bubbled", false)
+			player:SetAttribute("TrainBubbled", nil)
+			runtime.affectedPlayers[player] = nil
+
+			-- Pop sound is intentionally played at the player's final world position.
+			local popRoot = getCharacterRoot(player)
+			if popRoot then
+				playOneShotAt(POP_SOUND, popRoot.Position, 4)
+			end
+
+			-- defer avoids doing the full restore work directly inside the delayed
+			-- callback stack, which keeps this path a little cleaner.
+			task.defer(function()
+				if player.Parent then
+					releasePlayerFromTrain(player)
 				end
 			end)
-		end
-	end)
-end
-
--- Train movement
-
-local function runTrain(myToken)
-	if not trainModel or not mainZone or not startPivot or not endPivot then return end
-	if roundToken ~= myToken then return end
-
-	moving = true
-	local alreadyHit = {}
-	local startTime  = os.clock()
-	local prevTrainZ = startPivot.Position.Z
-
-	startTrainSound()
-	TrainRemote:FireAllClients("shake_start", trainModel)
-
-	local conn
-	conn = RunService.Heartbeat:Connect(function()
-		if roundToken ~= myToken then
-			conn:Disconnect()
-			moving = false
-			stopTrainSound()
-			stopFlicker()
-			TrainRemote:FireAllClients("shake_stop")
-			return
-		end
-
-		local elapsed = os.clock() - startTime
-		local alpha   = math.clamp(elapsed / TRAIN_DURATION, 0, 1)
-
-		trainModel:PivotTo(startPivot:Lerp(endPivot, alpha))
-
-		local trainZ = trainModel:GetPivot().Position.Z
-
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if alreadyHit[plr] then continue end
-			if plr:GetAttribute("State") ~= "Round" then continue end
-
-			local hrp = hrpOf(plr)
-			if not hrp then continue end
-			if not isInsidePart(mainZone, hrp.Position) then continue end
-
-			local playerZ = hrp.Position.Z
-			if playerZ <= prevTrainZ and playerZ >= trainZ then
-				alreadyHit[plr] = true
-				task.spawn(flingPlayer, plr, myToken)
-			end
-		end
-
-		prevTrainZ = trainZ
-
-		if alpha >= 1 then
-			conn:Disconnect()
-			moving = false
-			trainModel:PivotTo(startPivot)
-			stopTrainSound()
-			stopFlicker()
-			TrainRemote:FireAllClients("shake_stop")
-		end
-	end)
-end
-
--- Round lifecycle
-
-local function onRoundStart()
-	if CurrentMapName.Value ~= "Map3" then return end
-	if not trainModel then return end
-
-	roundToken += 1
-	local myToken = roundToken
-
-	task.wait(0.5) -- let RoundController finish setting RoundSecondsLeft
-	if roundToken ~= myToken then return end
-	if not RoundActive.Value then return end
-
-	local roundDuration = RoundSecondsLeft.Value
-	if roundDuration <= 0 then roundDuration = 60 end
-	local trainMax = math.max(TRAIN_EARLIEST, roundDuration - TRAIN_BUFFER_END)
-	local delay = math.random(TRAIN_EARLIEST, trainMax)
-	print("[TrainEvent] Scheduled in", delay, "s")
-
-	task.delay(math.max(0, delay - WARNING_TIME), function()
-		if roundToken ~= myToken then return end
-		if not RoundActive.Value then return end
-
-		playHorn()
-		startFlicker(myToken)
-
-		task.delay(WARNING_TIME, function()
-			if roundToken ~= myToken then return end
-			if not RoundActive.Value then return end
-			runTrain(myToken)
 		end)
 	end)
 end
 
-local function onRoundEnd()
-	roundToken += 1
-	stopFlicker()
-	stopTrainSound()
+-- Shared stop path used by both normal completion and cancellation.
+local function stopTrainEffects()
+	stopWarningFlicker()
+	stopTrainLoopSound()
 	TrainRemote:FireAllClients("shake_stop")
-
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if not trainAffected[plr] and not plr:GetAttribute("TrainFlung") then continue end
-		trainAffected[plr] = nil
-
-		plr:SetAttribute("TrainFlung", nil)
-		plr:SetAttribute("TrainBubbled", nil)
-		if plr:GetAttribute("Bubbled") == true then
-			plr:SetAttribute("Bubbled", false)
-		end
-
-		local h   = hrpOf(plr)
-		local c   = plr.Character
-		local hum = c and c:FindFirstChildOfClass("Humanoid")
-		if h then
-			h.Anchored = false
-			h.AssemblyLinearVelocity = Vector3.zero
-			h.AssemblyAngularVelocity = Vector3.zero
-		end
-		if hum then
-			hum:SetStateEnabled(Enum.HumanoidStateType.Running, true)
-			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-			hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
-			hum.AutoRotate = true
-		end
-	end
-
-	if trainModel and startPivot then trainModel:PivotTo(startPivot) end
-	moving = false
 end
 
-RoundActive.Changed:Connect(function(val)
-	if val == true then onRoundStart() else onRoundEnd() end
-end)
-
--- Map setup
-
-local function setupFromModel(subwayModel)
-	local subway = subwayModel:FindFirstChild("SUBWAY")
-	if not subway then return end
-
-	local train = subway:FindFirstChild("TRAIN")
-	if not train or not train:IsA("Model") then return end
-
-	local forScript = subway:FindFirstChild("ForScript")
-	if not forScript then return end
-
-	local main  = forScript:FindFirstChild("Main")
-	local left  = forScript:FindFirstChild("Left")
-	local right = forScript:FindFirstChild("Right")
-	if not main then return end
-
-	trainModel = train
-	mainZone   = main
-	leftPart   = left
-	rightPart  = right
-
-	-- Jump pad lights
-	jumpLights = {}
-	local jumpPads = subway:FindFirstChild("JumpPads")
-	if jumpPads then
-		for _, jump in ipairs(jumpPads:GetChildren()) do
-			if jump.Name == "JUMP" then
-				local light = jump:FindFirstChild("Light")
-				if light and light:IsA("BasePart") then
-					table.insert(jumpLights, light)
-				end
-			end
-		end
+-- Physically move the train through the station and detect crossings against
+-- players standing in the main track zone.
+local function runTrain(roundToken)
+	if not mapState.trainModel or not mapState.mainZone or not mapState.startPivot or not mapState.endPivot then
+		return
 	end
 
-	-- Ceiling lights — randomly pick half to flicker
-	ceilingLights = {}
-	flickerSet    = {}
-	local lightsFolder = subway:FindFirstChild("Lights")
-	if lightsFolder then
-		for _, cl in ipairs(lightsFolder:GetChildren()) do
-			if cl.Name == "Ceiling_Light" then
-				local beamBase = cl:FindFirstChild("BeamBase")
-				local lb = cl:FindFirstChild("lightbase")
-				if beamBase then
-					local beam = beamBase:FindFirstChildOfClass("Beam")
-					local spot = beamBase:FindFirstChildOfClass("SpotLight")
-					if beam or spot or lb then
-						table.insert(ceilingLights, { beam = beam, spot = spot, lightbase = lb })
-					end
-				end
+	if runtime.roundToken ~= roundToken then
+		return
+	end
+
+	-- Track which players were already processed during this train pass so a
+	-- single player cannot be hit multiple times in one movement.
+	local alreadyHit = {}
+	local startTime = os.clock()
+	local previousTrainZ = mapState.startPivot.Position.Z
+
+	-- Start audiovisual feedback before the first movement step.
+	startTrainLoopSound()
+	TrainRemote:FireAllClients("shake_start", mapState.trainModel)
+
+	local connection
+	connection = RunService.Heartbeat:Connect(function()
+		if runtime.roundToken ~= roundToken then
+			connection:Disconnect()
+			stopTrainEffects()
+			return
+		end
+
+		-- The train path is a linear interpolation between precomputed pivots.
+		local alpha = math.clamp((os.clock() - startTime) / CONFIG.TrainDuration, 0, 1)
+		mapState.trainModel:PivotTo(mapState.startPivot:Lerp(mapState.endPivot, alpha))
+
+		-- The hit test assumes the train moves along the negative Z axis.
+		-- A player is counted as hit when their Z lies between the last frame's Z
+		-- and the current frame's Z while they are inside the main danger volume.
+		local trainZ = mapState.trainModel:GetPivot().Position.Z
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			if alreadyHit[player] then
+				continue
+			end
+
+			-- Only active round players are valid hazard targets.
+			if player:GetAttribute("State") ~= "Round" then
+				continue
+			end
+
+			local root = getCharacterRoot(player)
+			if not root then
+				continue
+			end
+
+			if not isInsidePart(mapState.mainZone, root.Position) then
+				continue
+			end
+
+			local playerZ = root.Position.Z
+			if playerZ <= previousTrainZ and playerZ >= trainZ then
+				alreadyHit[player] = true
+				-- Spawn keeps the heartbeat loop responsive even if the fling setup work
+				-- becomes more expensive later.
+				task.spawn(flingPlayerToSafety, player, roundToken)
 			end
 		end
+
+		previousTrainZ = trainZ
+
+		if alpha < 1 then
+			return
+		end
+
+		-- When the train finishes its pass, snap it back to the start so the map is
+		-- ready for the next round without needing another setup pass.
+		connection:Disconnect()
+		mapState.trainModel:PivotTo(mapState.startPivot)
+		stopTrainEffects()
+	end)
+end
+
+-- Pick a valid random train time inside the round and stage the warning window.
+local function scheduleTrain(roundToken)
+	-- Small delay gives the round controller time to finish writing timing data.
+	task.wait(0.5)
+
+	if runtime.roundToken ~= roundToken or not RoundActive.Value then
+		return
 	end
+
+	local roundDuration = RoundSecondsLeft.Value
+	if roundDuration <= 0 then
+		roundDuration = 60
+	end
+
+	-- This caps the latest possible train start so the event does not happen too
+	-- close to the end of the round.
+	local latestStart = math.max(CONFIG.TrainEarliest, roundDuration - CONFIG.TrainBufferEnd)
+	local delaySeconds = math.random(CONFIG.TrainEarliest, latestStart)
+	print("[TrainEvent] Scheduled in", delaySeconds, "s")
+
+	-- The warning starts shortly before the train itself begins moving.
+	task.delay(math.max(0, delaySeconds - CONFIG.WarningTime), function()
+		if runtime.roundToken ~= roundToken or not RoundActive.Value then
+			return
+		end
+
+		-- Horn plays from the center of the danger zone to sell the incoming train.
+		if mapState.mainZone then
+			playOneShotAt(HORN_SOUND, mapState.mainZone.Position, 10)
+		end
+
+		startWarningFlicker(roundToken)
+
+		-- After the warning window expires, actually move the train.
+		task.delay(CONFIG.WarningTime, function()
+			if runtime.roundToken ~= roundToken or not RoundActive.Value then
+				return
+			end
+
+			runTrain(roundToken)
+		end)
+	end)
+end
+
+-- Entry point when RoundActive flips true.
+-- The script only runs on Map3 and only if the Subway map has already been bound.
+local function startRound()
+	if CurrentMapName.Value ~= "Map3" then
+		return
+	end
+
+	if not mapState.trainModel then
+		return
+	end
+
+	-- Capture the token for this specific round and schedule the event async.
+	local roundToken = nextRoundToken()
+	task.spawn(scheduleTrain, roundToken)
+end
+
+-- Entry point when RoundActive flips false.
+-- This aggressively restores any player or effect state the train could own.
+local function endRound()
+	nextRoundToken()
+	stopTrainEffects()
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if not runtime.affectedPlayers[player] and not player:GetAttribute("TrainFlung") then
+			continue
+		end
+
+		releasePlayerFromTrain(player)
+	end
+
+	-- Reset the train's physical placement so the station is left in a known state.
+	if mapState.trainModel and mapState.startPivot then
+		mapState.trainModel:PivotTo(mapState.startPivot)
+	end
+end
+
+-- Randomly choose half the ceiling fixtures to flicker.
+-- This is rebuilt on each map bind so the warning pattern is not identical.
+local function rebuildFlickerSet()
+	mapState.flickerSet = {}
 
 	local indices = {}
-	for i = 1, #ceilingLights do indices[i] = i end
-	for i = #indices, 2, -1 do
-		local j = math.random(1, i)
-		indices[i], indices[j] = indices[j], indices[i]
-	end
-	for i = 1, math.floor(#indices / 2) do
-		flickerSet[indices[i]] = true
+	for index = 1, #mapState.ceilingLights do
+		indices[index] = index
 	end
 
-	-- Train start/end positions (hardcoded Z offsets for the subway track)
+	-- Fisher-Yates shuffle to produce an unbiased random subset.
+	for index = #indices, 2, -1 do
+		local swapIndex = math.random(1, index)
+		indices[index], indices[swapIndex] = indices[swapIndex], indices[index]
+	end
+
+	for selectionIndex = 1, math.floor(#indices / 2) do
+		mapState.flickerSet[indices[selectionIndex]] = true
+	end
+end
+
+-- Discover all jump-pad lights that should switch to warning colors.
+local function collectJumpLights(subway)
+	mapState.jumpLights = {}
+
+	local jumpPads = subway:FindFirstChild("JumpPads")
+	if not jumpPads then
+		return
+	end
+
+	for _, jumpPad in ipairs(jumpPads:GetChildren()) do
+		if jumpPad.Name ~= "JUMP" then
+			continue
+		end
+
+		local light = jumpPad:FindFirstChild("Light")
+		if light and light:IsA("BasePart") then
+			table.insert(mapState.jumpLights, light)
+		end
+	end
+end
+
+-- Discover each ceiling light's components so the warning effect can adjust
+-- beam, spotlight, and base color where available.
+local function collectCeilingLights(subway)
+	mapState.ceilingLights = {}
+
+	local lightsFolder = subway:FindFirstChild("Lights")
+	if not lightsFolder then
+		mapState.flickerSet = {}
+		return
+	end
+
+	for _, ceilingLight in ipairs(lightsFolder:GetChildren()) do
+		if ceilingLight.Name ~= "Ceiling_Light" then
+			continue
+		end
+
+		local beamBase = ceilingLight:FindFirstChild("BeamBase")
+		local lightBase = ceilingLight:FindFirstChild("lightbase")
+		if not beamBase then
+			continue
+		end
+
+		-- Some fixtures may be partially built; only keep ones with at least one
+		-- visual component that can actually be modified.
+		local beam = beamBase:FindFirstChildOfClass("Beam")
+		local spot = beamBase:FindFirstChildOfClass("SpotLight")
+		if beam or spot or lightBase then
+			table.insert(mapState.ceilingLights, {
+				beam = beam,
+				spot = spot,
+				lightBase = lightBase,
+			})
+		end
+	end
+
+	rebuildFlickerSet()
+end
+
+-- Compute the travel path from hardcoded track coordinates while preserving the
+-- model's current orientation.
+local function buildTrackPivots(train)
 	local currentPivot = train:GetPivot()
-	local pos = currentPivot.Position
-	startPivot = CFrame.new(-96, pos.Y, 41.433)  * (currentPivot - currentPivot.Position)
-	endPivot   = CFrame.new(-96, pos.Y, -336.16) * (currentPivot - currentPivot.Position)
-	train:PivotTo(startPivot)
+	local currentPosition = currentPivot.Position
+	local rotationOnly = currentPivot - currentPosition
 
+	mapState.startPivot = CFrame.new(-96, currentPosition.Y, 41.433) * rotationOnly
+	mapState.endPivot = CFrame.new(-96, currentPosition.Y, -336.16) * rotationOnly
+end
+
+-- Clear every cached map reference when the Subway model leaves Workspace.
+-- This prevents stale instances from being used if the map is reloaded later.
+local function clearMapState()
+	stopTrainEffects()
+	nextRoundToken()
+
+	mapState.trainModel = nil
+	mapState.mainZone = nil
+	mapState.leftPlatform = nil
+	mapState.rightPlatform = nil
+	mapState.startPivot = nil
+	mapState.endPivot = nil
+	mapState.jumpLights = {}
+	mapState.ceilingLights = {}
+	mapState.flickerSet = {}
+end
+
+-- Bind the script to a specific live Subway model by resolving the parts and
+-- folders the hazard depends on.
+local function setupFromModel(subwayModel)
+	local subway = subwayModel:FindFirstChild("SUBWAY")
+	if not subway then
+		return
+	end
+
+	-- The train must be a Model because the script animates it via PivotTo.
+	local train = subway:FindFirstChild("TRAIN")
+	if not train or not train:IsA("Model") then
+		return
+	end
+
+	local forScript = subway:FindFirstChild("ForScript")
+	if not forScript then
+		return
+	end
+
+	-- Main is the only hard requirement for hazard logic. Left/Right are optional,
+	-- but if they exist the player is flung toward the nearest safe side.
+	local mainZone = forScript:FindFirstChild("Main")
+	if not mainZone or not mainZone:IsA("BasePart") then
+		return
+	end
+
+	local leftPlatform = forScript:FindFirstChild("Left")
+	local rightPlatform = forScript:FindFirstChild("Right")
+
+	-- Cache resolved references so runtime logic does not repeatedly search the tree.
+	mapState.trainModel = train
+	mapState.mainZone = mainZone
+	mapState.leftPlatform = leftPlatform
+	mapState.rightPlatform = rightPlatform
+
+	collectJumpLights(subway)
+	collectCeilingLights(subway)
+	buildTrackPivots(train)
+
+	-- Immediately place the train at its start location so the map is visually in
+	-- the expected idle state.
+	train:PivotTo(mapState.startPivot)
 	print("[TrainEvent] Registered:", train:GetFullName())
 
+	-- If the map appears in the middle of an active Map3 round, bootstrap the
+	-- train event for that round instead of waiting for the next one.
 	if RoundActive.Value and CurrentMapName.Value == "Map3" then
-		onRoundStart()
+		startRound()
 	end
 end
 
-local function clearRefs()
-	stopFlicker()
-	stopTrainSound()
-	trainModel = nil; mainZone = nil; leftPart = nil; rightPart = nil
-	startPivot = nil; endPivot = nil
-	jumpLights = {}; ceilingLights = {}; flickerSet = {}
-	roundToken += 1
-	moving = false
-end
+-- RoundActive is the top-level switch that drives the whole hazard lifecycle.
+RoundActive.Changed:Connect(function(isActive)
+	if isActive then
+		startRound()
+	else
+		endRound()
+	end
+end)
 
+-- The Subway model may be inserted dynamically after this script starts, so the
+-- script listens for it instead of assuming it already exists.
 Workspace.ChildAdded:Connect(function(child)
 	task.wait(0.2)
-	if child:IsA("Model") and child.Name == "Subway" then setupFromModel(child) end
+	if child:IsA("Model") and child.Name == "Subway" then
+		setupFromModel(child)
+	end
 end)
 
+-- Remove all cached references when the bound Subway model disappears.
 Workspace.ChildRemoved:Connect(function(child)
-	if child:IsA("Model") and child.Name == "Subway" then clearRefs() end
+	if child:IsA("Model") and child.Name == "Subway" then
+		clearMapState()
+	end
 end)
 
-Players.PlayerRemoving:Connect(function(plr)
-	trainAffected[plr] = nil
+-- Minimal cleanup for player tables when someone leaves the server.
+Players.PlayerRemoving:Connect(function(player)
+	runtime.affectedPlayers[player] = nil
 end)
 
+-- Handle the common case where the Subway map is already in Workspace before
+-- this server script begins executing.
 for _, child in ipairs(Workspace:GetChildren()) do
-	if child:IsA("Model") and child.Name == "Subway" then setupFromModel(child) end
+	if child:IsA("Model") and child.Name == "Subway" then
+		setupFromModel(child)
+	end
 end
 
 print("[TrainEvent] Loaded")
